@@ -1,0 +1,4 @@
+
+Started based on code from https://stackoverflow.com/questions/77821431/how-to-communicate-with-gdb-mi-using-stdin-using-c-for-linux-and-windows
+
+
