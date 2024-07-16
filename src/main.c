@@ -4,40 +4,180 @@
 #include <assert.h>
 #include <time.h>
 #include "subprocess.h"
+#include <poll.h>
 
-#define BUFFER_SIZE 32
+
+#define BUFFER_SIZE 128
 #define GDB_CMD "arm-none-eabi-gdb"
 
+enum channel {
+    IN = 0,
+    OUT,
+    ERR,
+    NONE
+};
 
-static void communicate(struct subprocess_s* sp)
+
+static void communicate(struct subprocess_s* sp, FILE* log)
 {
+    struct pollfd fds[3];
+    ssize_t length;
+    char buf[BUFFER_SIZE];
+    enum channel reported_channel = NONE;
     FILE* sub_out = subprocess_stdout(sp);
     FILE* sub_err = subprocess_stderr(sp);
     FILE* sub_in = subprocess_stdin(sp);
 
-
-    //while(1)
+    if((NULL == sub_out) || (NULL == sub_err) || (NULL == sub_in))
     {
-        // wait for new date on stdin, sub_out and sub_err
-        // select();
-
-        // std_in -> sub_in
-        // sub_out -> std_out
-        // sub_err -> std_err
+        fprintf(stderr, "ERROR: streams are NULL!\n");
+        fprintf(log, "ERROR: streams are NULL!\n");
+        return;
     }
 
-    /*
-        fgets(stdout_buf, BUFFER_SIZE, p_stdout);
-        printf("%s", stdout_buf);
-        fgets(stderr_buf, BUFFER_SIZE, p_stdout);
-        printf("%s", stderr_buf);
+    memset(buf, 0, sizeof(buf));
 
-        // int a = fprintf(p_stdin, "-break-insert main");
-        // printf("%d\n", a);
+    fds[0].fd = STDIN_FILENO;
+    fds[0].events = POLLIN;
+    fds[1].fd = fileno(sub_out);
+    fds[1].events = POLLIN;
+    fds[2].fd = fileno(sub_err);
+    fds[2].events = POLLIN;
 
-        fgets(stdout_buf, BUFFER_SIZE, p_stdout);
-        printf("%s", stdout_buf);
-    */
+
+    while(1)
+    {
+        int ret;
+        // wait for new data on stdin, sub_out and sub_err
+        ret = poll(fds, 3, 10);
+        if(-1 == ret)
+        {
+            fprintf(log, "ERROR: select() failed!\n");
+            return;
+        }
+        if(0 == ret)
+        {
+            // timeout -> ignore
+            fflush(stdout);
+        }
+
+        // stdin
+        if (fds[0].revents & POLLERR)  // poll ERROR
+        {
+            fprintf(log, "ERROR: poll error on stdin\n");
+            return;
+        }
+        if (fds[0].revents & POLLHUP)  // hang up
+        {
+            fprintf(log, "ERROR: hang up on stdin\n");
+            return;
+        }
+
+        if (fds[0].revents & POLLNVAL)  // invalid request fd not open
+        {
+            fprintf(log, "ERROR: poll invalid on stdin\n");
+            return;
+        }
+
+        // sub_out
+        if (fds[1].revents & POLLERR)  // poll ERROR
+        {
+            fprintf(log, "ERROR: poll error on sub_out\n");
+            return;
+        }
+        if (fds[1].revents & POLLHUP)  // hang up
+        {
+            fprintf(log, "INFO: hang up on sub_out\n");
+            return;
+        }
+
+        if (fds[1].revents & POLLNVAL)  // invalid request fd not open
+        {
+            fprintf(log, "ERROR: poll invalid on sub_out\n");
+            return;
+        }
+
+        // sub_err
+        if (fds[2].revents & POLLERR)  // poll ERROR
+        {
+            fprintf(log, "ERROR: poll error on sub_err\n");
+            return;
+        }
+        if (fds[2].revents & POLLHUP)  // hang up
+        {
+            fprintf(log, "ERROR: hang up on sub_err\n");
+            return;
+        }
+
+        if (fds[2].revents & POLLNVAL)  // invalid request fd not open
+        {
+            fprintf(log, "ERROR: poll invalid on sub_err\n");
+            return;
+        }
+
+        // stdin -> sub_in
+        if (fds[0].revents & POLLIN)
+        {
+            // receives something on stdin -> sub_in
+            do{
+                length = read(STDIN_FILENO, buf, BUFFER_SIZE);
+                if(0 < length)
+                {
+                    if(IN != reported_channel)
+                    {
+                        fprintf(log, "\nIN : ");
+                        reported_channel = IN;
+                    }
+                    fwrite(buf, length, 1, log);
+                    fwrite(buf, length, 1, sub_in);
+                    fflush(log);
+                    fflush(sub_in);
+                }
+            } while(BUFFER_SIZE == length);
+        }
+
+        // sub_out -> stdout
+        if (fds[1].revents & POLLIN)
+        {
+            // receives something on sub_out -> stdout
+            do{
+                length = read(fileno(sub_out), buf, BUFFER_SIZE);
+                if(0 < length)
+                {
+                    if(OUT != reported_channel)
+                    {
+                        fprintf(log, "\nOUT : ");
+                        reported_channel = OUT;
+                    }
+                    fwrite(buf, length, 1, log);
+                    fwrite(buf, length, 1, stdout);
+                    fflush(log);
+                    fflush(stdout);
+                }
+            }  while(BUFFER_SIZE == length);
+        }
+
+        // sub_err -> stderr
+        if (fds[2].revents & POLLIN)
+        {
+            // receives something on sub_err -> stderr
+            do{
+                length = read(fileno(sub_err), buf, BUFFER_SIZE);
+                if(0 < length)
+                {
+                    if(ERR != reported_channel)
+                    {
+                        fprintf(log, "\nERR : ");
+                        reported_channel = ERR;
+                    }
+                    fwrite(buf, length, 1, log);
+                    fwrite(buf, length, 1, stderr);
+                    fflush(log);
+                    fflush(stderr);
+                }
+            } while(BUFFER_SIZE == length);
+        }
+    }
 }
 
 int main(int argc, char * argv[])
@@ -47,14 +187,11 @@ int main(int argc, char * argv[])
     //  123456789012345678901234567890123
     // "24-07-11_12-23_31_wrapper_log.txt"
     char log_filename[40];
-    char stdout_buf[BUFFER_SIZE];
-    char stderr_buf[BUFFER_SIZE];
+
     time_t t = time(NULL);
     struct tm tm = *localtime(&t);
 
     memset(log_filename, 0, sizeof(log_filename));
-    memset(stdout_buf, 0, sizeof(stdout_buf));
-    memset(stderr_buf, 0, sizeof(stderr_buf));
 
     snprintf(log_filename, sizeof(log_filename),
         "%02d-%02d-%02d_%02d-%02d-%02d_wrapper_log.txt",
@@ -64,15 +201,15 @@ int main(int argc, char * argv[])
     FILE* log = fopen(&log_filename[0], "w");
     if(NULL == log)
     {
-        fprintf(stderr, "Erro: can't open %s\n", &log_filename[0]);
-        fprintf(log, "Erro: can't open %s\n", &log_filename[0]);
+        fprintf(stderr, "ERROR: can't open %s\n", &log_filename[0]);
+        fprintf(log, "ERROR: can't open %s\n", &log_filename[0]);
         fclose(log);
         return -1;
     }
 
     fprintf(log, "gdb wrapper log file\n");
 
-    // report command line paraeters
+    // report command line parameters
     fprintf(log, "command line parameters:");
     for(i = 0; i < argc; i++)
     {
@@ -91,21 +228,21 @@ int main(int argc, char * argv[])
                         , &gdb_sp);
     if(gdb_status != 0)
     {
-        fprintf(stderr, "Erro: can't open %s, check if its is installed\n", GDB_CMD);
-        fprintf(log, "Erro: can't open %s, check if its is installed\n", GDB_CMD);
+        fprintf(stderr, "ERROR: can't open %s, check if its is installed\n", GDB_CMD);
+        fprintf(log, "ERROR: can't open %s, check if its is installed\n", GDB_CMD);
         fclose(log);
         return -2;
     }
 
-    communicate(&gdb_sp);
+    communicate(&gdb_sp, log);
 
     int ret = -1;
     subprocess_join(&gdb_sp, &ret);
     if(ret != 0 ) {
-        fprintf(stderr, "Erro: could not join GDB process!\n");
-        fprintf(log, "Erro: could not join GDB process!\n");
+        fprintf(stderr, "ERROR: could not join GDB process!\n");
+        fprintf(log, "ERROR: could not join GDB process!\n");
         fclose(log);
-        return -1;
+        return -3;
     }
 
     assert(!subprocess_destroy(&gdb_sp));
